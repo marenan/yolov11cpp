@@ -7,10 +7,6 @@
 
 #include "./ia/YOLO11.hpp" 
 
-// Include the bounded queue
-#include "tools/BoundedThreadSafeQueue.hpp"
-
-
 int main()
 {
     // Configuration parameters
@@ -20,10 +16,14 @@ int main()
     const std::string videoSource = "./input.mov"; // your usb cam device
     const std::string outputPath = "./output.mp4"; // path for output video file
     
-    // Set rotation angle based on input video orientation (0, 90, 180, or 270 degrees)
-
+    // Use the same default thresholds as Ultralytics CLI
+    const float confThreshold = 0.25f;  // Match Ultralytics default confidence threshold
+    const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
+    
+    std::cout << "Initializing YOLOv11 detector with model: " << modelPath << std::endl;
+    std::cout << "Using confidence threshold: " << confThreshold << ", IoU threshold: " << iouThreshold << std::endl;
+    
     // Initialize YOLO detector
-    // YOLO9Detector detector(modelPath, labelsPath, isGPU);
     YOLO11Detector detector(modelPath, labelsPath, isGPU);
 
     // Open video capture
@@ -56,6 +56,9 @@ int main()
     std::cout << "Recording output to: " << outputPath << std::endl;
     std::cout << "Press 'q' to stop recording and exit" << std::endl;
 
+    int frame_count = 0;
+    double total_time = 0.0;
+
     for (;;)
     {
         cv::Mat frame;
@@ -69,14 +72,27 @@ int main()
         // Display the frame
         cv::imshow("input", frame);
 
-        // Perform detection on the rotated frame
-        std::vector<Detection> detections = detector.detect(frame);
+        // Measure detection time
+        auto start_time = std::chrono::high_resolution_clock::now();
+        
+        // Perform detection with the updated thresholds
+        std::vector<Detection> detections = detector.detect(frame, confThreshold, iouThreshold);
+        
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        total_time += duration;
+        frame_count++;
 
         // Create a copy for output with detections drawn
         cv::Mat outputFrame = frame.clone();
         
         // Draw bounding boxes and masks on the frame
         detector.drawBoundingBoxMask(outputFrame, detections);
+
+        // Add FPS info
+        double fps = 1000.0 / (total_time / frame_count);
+        cv::putText(outputFrame, "FPS: " + std::to_string(static_cast<int>(fps)), 
+                   cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
 
         // Write the processed frame to the output video
         videoWriter.write(outputFrame);
@@ -97,6 +113,7 @@ int main()
     cv::destroyAllWindows();
     
     std::cout << "Video processing completed. Output saved to: " << outputPath << std::endl;
+    std::cout << "Average FPS: " << (1000.0 / (total_time / frame_count)) << std::endl;
 
     return 0;
 }

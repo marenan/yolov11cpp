@@ -706,27 +706,28 @@ cv::Mat YOLO11Detector::preprocess(const cv::Mat &image, float *&blob, std::vect
     // Resize and pad the image using letterBox utility
     utils::letterBox(image, resizedImage, inputImageShape, cv::Scalar(114, 114, 114), isDynamicInputShape, false, true, 32);
 
-    // Update input tensor shape based on resized image dimensions
-    inputTensorShape[2] = resizedImage.rows;
-    inputTensorShape[3] = resizedImage.cols;
+    // Convert BGR to RGB (YOLOv11 expects RGB input)
+    cv::Mat rgbImage;
+    cv::cvtColor(resizedImage, rgbImage, cv::COLOR_BGR2RGB);
 
-    // Convert image to float and normalize to [0, 1]
-    resizedImage.convertTo(resizedImage, CV_32FC3, 1 / 255.0f);
+    // YOLOv11 normalization: Convert to float, normalize to [0, 1]
+    rgbImage.convertTo(rgbImage, CV_32FC3, 1.0f/255.0f);
 
     // Allocate memory for the image blob in CHW format
-    blob = new float[resizedImage.cols * resizedImage.rows * resizedImage.channels()];
+    blob = new float[rgbImage.cols * rgbImage.rows * rgbImage.channels()];
 
     // Split the image into separate channels and store in the blob
-    std::vector<cv::Mat> chw(resizedImage.channels());
-    for (int i = 0; i < resizedImage.channels(); ++i) {
-        chw[i] = cv::Mat(resizedImage.rows, resizedImage.cols, CV_32FC1, blob + i * resizedImage.cols * resizedImage.rows);
+    std::vector<cv::Mat> chw(rgbImage.channels());
+    for (int i = 0; i < rgbImage.channels(); ++i) {
+        chw[i] = cv::Mat(rgbImage.rows, rgbImage.cols, CV_32FC1, blob + i * rgbImage.cols * rgbImage.rows);
     }
-    cv::split(resizedImage, chw); // Split channels into the blob
+    cv::split(rgbImage, chw); // Split channels into the blob
 
-    DEBUG_PRINT("Preprocessing completed")
+    DEBUG_PRINT("Preprocessing completed with RGB conversion");
 
-    return resizedImage;
+    return rgbImage;
 }
+
 // Postprocess function to convert raw model output into detections
 std::vector<Detection> YOLO11Detector::postprocess(
     const cv::Size &originalImageSize,
@@ -844,6 +845,12 @@ std::vector<Detection> YOLO11Detector::postprocess(
 // Detect function implementation
 std::vector<Detection> YOLO11Detector::detect(const cv::Mat& image, float confThreshold, float iouThreshold) {
     ScopedTimer timer("Overall detection");
+
+    // Check for empty images
+    if (image.empty()) {
+        std::cerr << "Error: Empty image provided to detector" << std::endl;
+        return {};
+    }
 
     float* blobPtr = nullptr; // Pointer to hold preprocessed image data
     // Define the shape of the input tensor (batch size, channels, height, width)

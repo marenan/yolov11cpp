@@ -2,16 +2,6 @@
 #ifndef SCOPEDTIMER_HPP
 #define SCOPEDTIMER_HPP
 
-/**
- * @file ScopedTimer.hpp
- * @brief Header file for timing utilities.
- * 
- * This file defines the ScopedTimer class, which measures the duration of a 
- * code block for performance profiling. When TIMING_MODE is defined, it records
- * the time taken for execution and prints it to the standard output upon 
- * destruction; otherwise, it provides an empty implementation.
- */
-
 #include <chrono>
 #include <iostream>
 #include <string>
