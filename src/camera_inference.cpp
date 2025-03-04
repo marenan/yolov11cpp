@@ -4,15 +4,17 @@
 #include <atomic>
 
 #include <opencv2/highgui/highgui.hpp>
+#include <opencv2/dnn/dnn.hpp>
 
 #include "./ia/YOLO11.hpp" 
 
 int main()
 {
+
     // Configuration parameters
     const bool isGPU = false;
     const std::string labelsPath = "./classes.txt";
-    const std::string modelPath = "./best.onnx";
+    const std::string modelPath = "./best_optmized.onnx";
     const std::string videoSource = "./input.mov"; // your usb cam device
     const std::string outputPath = "./output.mp4"; // path for output video file
     
@@ -23,6 +25,9 @@ int main()
     std::cout << "Initializing YOLOv11 detector with model: " << modelPath << std::endl;
     std::cout << "Using confidence threshold: " << confThreshold << ", IoU threshold: " << iouThreshold << std::endl;
     
+    // read model 
+    std::cout << "Loading model and labels..." << std::endl;
+
     // Initialize YOLO detector
     YOLO11Detector detector(modelPath, labelsPath, isGPU);
 
@@ -44,7 +49,7 @@ int main()
     
     // Initialize video writer
     cv::VideoWriter videoWriter;
-    int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v'); // MP4 codec
+    int fourcc = cv::VideoWriter::fourcc('a', 'v', 'c', '1'); // H.264 codec
     
     // Open the video writer
     bool isWriterOpened = videoWriter.open(outputPath, fourcc, fps, cv::Size(width, height), true);
