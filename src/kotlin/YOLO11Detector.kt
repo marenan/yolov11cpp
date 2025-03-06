@@ -1,4 +1,4 @@
-package com.yolov11kotlin
+package com.example.opencv_tutorial
 
 import android.content.Context
 import android.graphics.Bitmap
@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.os.SystemClock
+import android.util.Log
 import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
@@ -22,6 +23,7 @@ import java.util.*
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.round
+//import android.util.Log
 
 /**
  * YOLOv11Detector for Android using TFLite and OpenCV
@@ -35,24 +37,28 @@ class YOLO11Detector(
     private val labelsPath: String,
     useGPU: Boolean = true
 ) {
-    // Detection parameters
+    // Detection parameters - matching C++ implementation
     companion object {
-        const val CONFIDENCE_THRESHOLD = 0.4f
-        const val IOU_THRESHOLD = 0.3f
+        // Match the C++ implementation thresholds
+        const val CONFIDENCE_THRESHOLD = 0.25f  // Changed from 0.4f to match C++ code
+        const val IOU_THRESHOLD = 0.45f         // Changed from 0.3f to match C++ code
+        private const val TAG = "YOLO11Detector"
     }
 
     // Data structures for model and inference
     private var interpreter: Interpreter
     private val classNames: List<String>
     private val classColors: List<IntArray>
+    private var gpuDelegate: GpuDelegate? = null
 
     // Input shape info
     private var inputWidth: Int = 640
     private var inputHeight: Int = 640
     private var isQuantized: Boolean = false
+    private var numClasses: Int = 0
 
     init {
-        // Load model
+        // Load model with proper options
         val tfliteOptions = Interpreter.Options()
 
         // GPU Delegate setup if available and requested
@@ -61,10 +67,11 @@ class YOLO11Detector(
             if (compatList.isDelegateSupportedOnThisDevice) {
                 debug("GPU acceleration enabled")
                 val delegateOptions = compatList.bestOptionsForThisDevice
-                val gpuDelegate = GpuDelegate(delegateOptions)
+                gpuDelegate = GpuDelegate(delegateOptions)
                 tfliteOptions.addDelegate(gpuDelegate)
             } else {
                 debug("GPU acceleration not supported, using CPU")
+                tfliteOptions.setNumThreads(4)
             }
         } else {
             debug("Using CPU for inference")
@@ -82,12 +89,23 @@ class YOLO11Detector(
         inputWidth = inputShape[2]
         isQuantized = inputTensor.dataType() == org.tensorflow.lite.DataType.UINT8
 
+        // Get output shape information to determine number of classes
+        val outputTensor = interpreter.getOutputTensor(0)
+        val outputShape = outputTensor.shape()
+        numClasses = outputShape[1] - 4 // The output contains [x, y, w, h, class1, class2, ...]
+
         debug("Model loaded with input dimensions: $inputWidth x $inputHeight")
         debug("Model uses ${if(isQuantized) "quantized" else "float"} input")
+        debug("Model output shape: ${outputShape.joinToString()}")
+        debug("Detected $numClasses classes")
 
         // Load class names and generate colors
         classNames = loadClassNames(labelsPath)
         classColors = generateColors(classNames.size)
+
+        if (classNames.size != numClasses) {
+            debug("Warning: Number of classes in label file (${classNames.size}) differs from model output ($numClasses)")
+        }
 
         debug("Loaded ${classNames.size} classes")
     }
@@ -98,6 +116,7 @@ class YOLO11Detector(
     fun detect(bitmap: Bitmap, confidenceThreshold: Float = CONFIDENCE_THRESHOLD,
                iouThreshold: Float = IOU_THRESHOLD): List<Detection> {
         val startTime = SystemClock.elapsedRealtime()
+        debug("Starting detection with conf=$confidenceThreshold, iou=$iouThreshold")
 
         // Convert Bitmap to Mat for OpenCV processing
         val inputMat = Mat()
@@ -106,8 +125,17 @@ class YOLO11Detector(
 
         // Prepare input for TFLite
         val originalSize = Size(bitmap.width.toDouble(), bitmap.height.toDouble())
-        val inputData = prepareInput(inputMat)
-        val outputs = runInference(inputData)
+        val resizedImgMat = Mat() // Will hold the resized image
+
+        // First preprocess using OpenCV (exactly like C++ version)
+        val inputTensor = preprocessImageOpenCV(
+            inputMat,
+            resizedImgMat,
+            Size(inputWidth.toDouble(), inputHeight.toDouble())
+        )
+
+        // Run inference
+        val outputs = runInference(inputTensor)
 
         // Process outputs to get detections
         val detections = postprocess(
@@ -118,7 +146,9 @@ class YOLO11Detector(
             iouThreshold
         )
 
+        // Clean up
         inputMat.release()
+        resizedImgMat.release()
 
         val inferenceTime = SystemClock.elapsedRealtime() - startTime
         debug("Detection completed in $inferenceTime ms with ${detections.size} objects")
@@ -127,47 +157,58 @@ class YOLO11Detector(
     }
 
     /**
-     * Prepares the input image for TFLite inference
+     * Preprocess the input image using OpenCV to match the C++ implementation exactly
      */
-    private fun prepareInput(image: Mat): ByteBuffer {
+    private fun preprocessImageOpenCV(image: Mat, outImage: Mat, newShape: Size): ByteBuffer {
         val scopedTimer = ScopedTimer("preprocessing")
 
-        // Create resized image with letterboxing
-        val resizedImage = Mat()
-        letterBox(image, resizedImage, Size(inputWidth.toDouble(), inputHeight.toDouble()), Scalar(114.0, 114.0, 114.0))
+        // Resize with letterboxing to maintain aspect ratio (identical to C++ version)
+        letterBox(image, outImage, newShape, Scalar(114.0, 114.0, 114.0))
+
+        // Convert BGR to RGB (YOLOv11 expects RGB input)
+        val rgbMat = Mat()
+        Imgproc.cvtColor(outImage, rgbMat, Imgproc.COLOR_BGR2RGB)
+
+        // DEBUG: Output dimensions for verification
+        debug("Preprocessed image dimensions: ${rgbMat.width()}x${rgbMat.height()}")
 
         // Prepare the ByteBuffer to store the model input data
         val bytesPerChannel = if (isQuantized) 1 else 4
         val inputBuffer = ByteBuffer.allocateDirect(1 * inputWidth * inputHeight * 3 * bytesPerChannel)
         inputBuffer.order(ByteOrder.nativeOrder())
 
-        // Convert to RGB and normalize
-        val rgbMat = Mat()
-        Imgproc.cvtColor(resizedImage, rgbMat, Imgproc.COLOR_BGR2RGB)
+        try {
+            // Convert to proper format for TFLite
+            if (isQuantized) {
+                // For quantized models, prepare as bytes
+                val pixels = ByteArray(rgbMat.width() * rgbMat.height() * rgbMat.channels())
+                rgbMat.get(0, 0, pixels)
 
-        // Extract pixels and normalize
-        val pixels = ByteArray(rgbMat.width() * rgbMat.height() * 3)
-        rgbMat.get(0, 0, pixels)
-
-        // Process and convert the pixels
-        var pixel = 0
-        for (y in 0 until inputHeight) {
-            for (x in 0 until inputWidth) {
-                for (c in 0 until 3) {
-                    val value = pixels[pixel++].toInt() and 0xFF
-                    if (isQuantized) {
-                        inputBuffer.put(value.toByte())
-                    } else {
-                        inputBuffer.putFloat(value / 255.0f)
-                    }
+                for (i in pixels.indices) {
+                    inputBuffer.put(pixels[i])
                 }
+            } else {
+                // For float models, normalize to [0,1]
+                // CRITICAL: Create a normalized float Mat directly using OpenCV for better precision
+                val normalizedMat = Mat()
+                rgbMat.convertTo(normalizedMat, CvType.CV_32FC3, 1.0/255.0)
+
+                // Now copy the normalized float values to TFLite input buffer
+                val floatValues = FloatArray(normalizedMat.width() * normalizedMat.height() * normalizedMat.channels())
+                normalizedMat.get(0, 0, floatValues)
+
+                for (value in floatValues) {
+                    inputBuffer.putFloat(value)
+                }
+
+                normalizedMat.release()
             }
+        } catch (e: Exception) {
+            debug("Error during preprocessing: ${e.message}")
+            e.printStackTrace()
         }
 
         inputBuffer.rewind()
-
-        // Clean up OpenCV resources
-        resizedImage.release()
         rgbMat.release()
 
         scopedTimer.stop()
@@ -180,32 +221,51 @@ class YOLO11Detector(
     private fun runInference(inputBuffer: ByteBuffer): Map<Int, Any> {
         val scopedTimer = ScopedTimer("inference")
 
-        // Define outputs based on the model
         val outputs: MutableMap<Int, Any> = HashMap()
 
-        // YOLOv11 outputs a single tensor with shape [1, 4+num_classes, num_detections]
-        val outputShape = interpreter.getOutputTensor(0).shape()
-        val numFeatures = outputShape[1]
-        val numDetections = outputShape[2]
+        try {
+            // YOLOv11 with TFLite typically outputs a single tensor
+            val outputShape = interpreter.getOutputTensor(0).shape()
+            debug("Output tensor shape: ${outputShape.joinToString()}")
 
-        val outputBuffer = if (isQuantized) {
-            ByteBuffer.allocateDirect(4 * numFeatures * numDetections)
-        } else {
-            ByteBuffer.allocateDirect(4 * numFeatures * numDetections)
+            // Correctly allocate output buffer based on the shape
+            if (isQuantized) {
+                val outputSize = outputShape.reduce { acc, i -> acc * i }
+                val outputBuffer = ByteBuffer.allocateDirect(4 * outputSize)
+                    .order(ByteOrder.nativeOrder())
+                outputs[0] = outputBuffer
+
+                // Run inference with quantized model
+                interpreter.run(inputBuffer, outputBuffer)
+            } else {
+                val outputSize = outputShape.reduce { acc, i -> acc * i }
+                val outputBuffer = ByteBuffer.allocateDirect(4 * outputSize)
+                    .order(ByteOrder.nativeOrder())
+                outputs[0] = outputBuffer
+
+                // Run inference with float model
+                interpreter.run(inputBuffer, outputBuffer)
+
+                // Debug: Peek at some values to verify output format
+                outputBuffer.rewind()
+                val values = FloatArray(min(10, outputSize))
+                for (i in values.indices) {
+                    values[i] = outputBuffer.float
+                }
+                debug("First few output values: ${values.joinToString()}")
+                outputBuffer.rewind()
+            }
+        } catch (e: Exception) {
+            debug("Error during inference: ${e.message}")
+            e.printStackTrace()
         }
-        outputBuffer.order(ByteOrder.nativeOrder())
-
-        outputs[0] = outputBuffer
-
-        // Run inference
-        interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
 
         scopedTimer.stop()
         return outputs
     }
 
     /**
-     * Post-processes the model outputs to extract detections
+     * Post-processes the model outputs to extract detections in the exact same way as C++
      */
     private fun postprocess(
         outputMap: Map<Int, Any>,
@@ -218,99 +278,157 @@ class YOLO11Detector(
 
         val detections = mutableListOf<Detection>()
 
-        // Get output buffer
-        val outputBuffer = outputMap[0] as ByteBuffer
-        outputBuffer.rewind()
+        try {
+            // Get output buffer
+            val outputBuffer = outputMap[0] as ByteBuffer
+            outputBuffer.rewind()
 
-        // Get output dimensions
-        val outputShapes = interpreter.getOutputTensor(0).shape()
-        val numFeatures = outputShapes[1]
-        val numDetections = outputShapes[2]
+            // Get output dimensions - match the C++ version's expectations
+            val outputShapes = interpreter.getOutputTensor(0).shape()
+            debug("Output tensor shape: ${outputShapes.joinToString()}")
 
-        // Calculate number of classes
-        val numClasses = numFeatures - 4
+            // Using correct indexing based on tensor shape: [batch, features, detections]
+            val num_features = outputShapes[1]  // Total features = 4 box coords + num classes
+            val num_detections = outputShapes[2] // Number of detection boxes
 
-        // Extract boxes, confidences, and class ids
-        val boxes = mutableListOf<RectF>()
-        val confidences = mutableListOf<Float>()
-        val classIds = mutableListOf<Int>()
-        val nmsBoxes = mutableListOf<RectF>()
+            // Calculate number of classes (features minus 4 coordinates)
+            numClasses = num_features - 4
 
-        // Process each detection
-        for (d in 0 until numDetections) {
-            // Get bounding box coordinates
-            val centerX = outputBuffer.getFloat()
-            val centerY = outputBuffer.getFloat()
-            val width = outputBuffer.getFloat()
-            val height = outputBuffer.getFloat()
+            debug("Processing output tensor: features=$num_features, detections=$num_detections, classes=$numClasses")
 
-            // Find class with maximum score
-            var maxScore = -Float.MAX_VALUE
-            var classId = -1
+            // Extract boxes, confidences, and class ids
+            val boxes = mutableListOf<RectF>()
+            val confidences = mutableListOf<Float>()
+            val classIds = mutableListOf<Int>()
+            val nmsBoxes = mutableListOf<RectF>() // For class-separated NMS
 
-            for (c in 0 until numClasses) {
-                val score = outputBuffer.getFloat()
-                if (score > maxScore) {
-                    maxScore = score
-                    classId = c
+            // Create a float array from the buffer for more efficient access
+            val outputArray = FloatArray(outputShapes[0] * num_features * num_detections)
+            outputBuffer.rewind()
+            for (i in outputArray.indices) {
+                outputArray[i] = outputBuffer.float
+            }
+
+            // Process each detection with corrected access pattern
+            for (d in 0 until num_detections) {
+                // Read coordinates - fix the access pattern to match C++ implementation
+                // The data is arranged as [x1,x2,...,xn, y1,y2,...,yn, w1,w2,...,wn, h1,h2,...,hn, scores...]
+                val centerX = outputArray[0 * num_detections + d]
+                val centerY = outputArray[1 * num_detections + d]
+                val width = outputArray[2 * num_detections + d]
+                val height = outputArray[3 * num_detections + d]
+
+                // Find class with maximum score
+                var maxScore = -Float.MAX_VALUE
+                var classId = -1
+
+                // Read class scores with corrected access pattern
+                for (c in 0 until numClasses) {
+                    val score = outputArray[(4 + c) * num_detections + d]
+                    if (score > maxScore) {
+                        maxScore = score
+                        classId = c
+                    }
+                }
+
+                // Keep detections above threshold
+                if (maxScore > confThreshold) {
+                    // Convert center coordinates to top-left format
+                    val left = centerX - width / 2.0f
+                    val top = centerY - height / 2.0f
+                    val right = centerX + width / 2.0f
+                    val bottom = centerY + height / 2.0f
+
+                    // Log coordinates for debugging
+                    debug("Detection $d: center=($centerX,$centerY), wh=($width,$height), score=$maxScore, class=$classId")
+
+                    // Scale coordinates to original image size
+                    val scaledBox = scaleCoords(
+                        resizedImageShape,
+                        RectF(left, top, right, bottom),
+                        originalImageSize
+                    )
+
+                    // Validate the box has positive dimensions before adding
+                    val boxWidth = scaledBox.right - scaledBox.left
+                    val boxHeight = scaledBox.bottom - scaledBox.top
+                    
+                    if (boxWidth > 1 && boxHeight > 1) {  // Require at least 1x1 pixel
+                        // Round coordinates to integer precision (match C++ implementation)
+                        val roundedBox = RectF(
+                            round(scaledBox.left),
+                            round(scaledBox.top),
+                            round(scaledBox.right),
+                            round(scaledBox.bottom)
+                        )
+
+                        // Create offset box for NMS with class separation (exactly like C++)
+                        val nmsBox = RectF(
+                            roundedBox.left + classId * 7680f,
+                            roundedBox.top + classId * 7680f,
+                            roundedBox.right + classId * 7680f,
+                            roundedBox.bottom + classId * 7680f
+                        )
+
+                        nmsBoxes.add(nmsBox)
+                        boxes.add(roundedBox)
+                        confidences.add(maxScore)
+                        classIds.add(classId)
+                    } else {
+                        debug("Skipped detection with invalid dimensions: ${boxWidth}x${boxHeight}")
+                    }
                 }
             }
 
-            // Keep detections above threshold
-            if (maxScore > confThreshold) {
-                // Convert center coordinates to top-left format
-                val left = centerX - width / 2.0f
-                val top = centerY - height / 2.0f
+            debug("Found ${boxes.size} raw detections before NMS")
 
-                // Scale coordinates to original image size
-                val scaledBox = scaleCoords(
-                    resizedImageShape,
-                    RectF(left, top, left + width, top + height),
-                    originalImageSize
-                )
+            // Run NMS to eliminate redundant boxes
+            val selectedIndices = mutableListOf<Int>()
+            nonMaxSuppression(nmsBoxes, confidences, confThreshold, iouThreshold, selectedIndices)
 
-                // Ensure box coordinates are valid
-                val roundedBox = RectF(
-                    round(scaledBox.left),
-                    round(scaledBox.top),
-                    round(scaledBox.right),
-                    round(scaledBox.bottom)
-                )
+            debug("After NMS: ${selectedIndices.size} detections remaining")
 
-                // Create offset box for NMS
-                val nmsBox = RectF(
-                    roundedBox.left + classId * 7680,
-                    roundedBox.top + classId * 7680,
-                    roundedBox.right + classId * 7680,
-                    roundedBox.bottom + classId * 7680
-                )
+            // Create final detection objects
+            for (idx in selectedIndices) {
+                val box = boxes[idx]
 
-                nmsBoxes.add(nmsBox)
-                boxes.add(roundedBox)
-                confidences.add(maxScore)
-                classIds.add(classId)
-            }
-        }
+                // Fix: Calculate width and height correctly from left, top, right, bottom
+                val width = box.right - box.left
+                val height = box.bottom - box.top
 
-        // Run NMS to eliminate redundant boxes
-        val selectedIndices = mutableListOf<Int>()
-        nonMaxSuppression(nmsBoxes, confidences, confThreshold, iouThreshold, selectedIndices)
+                // Skip invalid boxes
+                if (width <= 0 || height <= 0) {
+                    debug("Skipped invalid box with dimensions: ${width}x${height}")
+                    continue
+                }
 
-        // Create final detection objects
-        selectedIndices.forEach { idx ->
-            val box = boxes[idx]
-            detections.add(
-                Detection(
+                // Verify class ID is valid
+                val validClassId = if (classIds[idx] >= 0 && classIds[idx] < classNames.size) {
+                    classIds[idx]
+                } else {
+                    debug("Invalid class ID: ${classIds[idx]}. Using fallback.")
+                    0 // Fallback to first class
+                }
+
+                // Create detection with correct coordinates
+                val detection = Detection(
                     BoundingBox(
                         box.left.toInt(),
                         box.top.toInt(),
-                        (box.right - box.left).toInt(),
-                        (box.bottom - box.top).toInt()
+                        width.toInt(),
+                        height.toInt()
                     ),
                     confidences[idx],
-                    classIds[idx]
+                    validClassId
                 )
-            )
+
+                detections.add(detection)
+                debug("Added detection: box=${detection.box.x},${detection.box.y},${detection.box.width},${detection.box.height}, " +
+                      "conf=${detection.conf}, class=${validClassId}")
+            }
+        } catch (e: Exception) {
+            debug("Error during postprocessing: ${e.message}")
+            e.printStackTrace()
         }
 
         scopedTimer.stop()
@@ -331,11 +449,14 @@ class YOLO11Detector(
         textPaint.style = Paint.Style.FILL
         textPaint.textSize = max(bitmap.width, bitmap.height) * 0.02f
 
-        for (detection in detections) {
-            if (detection.conf <= CONFIDENCE_THRESHOLD) continue
+        // Filter detections to ensure quality results
+        val filteredDetections = detections.filter {
+            it.conf > CONFIDENCE_THRESHOLD &&
+                    it.classId >= 0 &&
+                    it.classId < classNames.size
+        }
 
-            if (detection.classId < 0 || detection.classId >= classNames.size) continue
-
+        for (detection in filteredDetections) {
             // Get color for this class
             val color = classColors[detection.classId % classColors.size]
             paint.color = Color.rgb(color[0], color[1], color[2])
@@ -397,7 +518,7 @@ class YOLO11Detector(
         val maskBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val maskCanvas = Canvas(maskBitmap)
 
-        // Filter detections
+        // Filter detections to ensure quality results
         val filteredDetections = detections.filter {
             it.conf > CONFIDENCE_THRESHOLD &&
                     it.classId >= 0 &&
@@ -528,10 +649,39 @@ class YOLO11Detector(
     }
 
     /**
+     * Get class name for a given class ID
+     * @param classId The class ID to get the name for
+     * @return The class name or "Unknown" if the ID is invalid
+     */
+    fun getClassName(classId: Int): String {
+        return if (classId >= 0 && classId < classNames.size) {
+            classNames[classId]
+        } else {
+            "Unknown"
+        }
+    }
+
+    /**
+     * Get details about the model's input requirements
+     * @return String containing shape and data type information
+     */
+    fun getInputDetails(): String {
+        val inputTensor = interpreter.getInputTensor(0)
+        val shape = inputTensor.shape()
+        val type = when(inputTensor.dataType()) {
+            org.tensorflow.lite.DataType.FLOAT32 -> "FLOAT32"
+            org.tensorflow.lite.DataType.UINT8 -> "UINT8"
+            else -> "OTHER"
+        }
+        return "Shape: ${shape.joinToString()}, Type: $type"
+    }
+
+    /**
      * Cleanup resources when no longer needed
      */
     fun close() {
         interpreter.close()
+        gpuDelegate?.close()
     }
 
     /**
@@ -547,6 +697,7 @@ class YOLO11Detector(
 
     /**
      * Letterbox an image to fit a specific size while maintaining aspect ratio
+     * Fixed to convert Double to Float for proper type handling
      */
     private fun letterBox(
         image: Mat,
@@ -560,36 +711,40 @@ class YOLO11Detector(
     ) {
         val originalShape = Size(image.cols().toDouble(), image.rows().toDouble())
 
-        // Calculate ratio to fit the image within new shape
+        // Calculate ratio to fit the image within new shape - convert to Float
         var ratio = min(
             newShape.height / originalShape.height,
             newShape.width / originalShape.width
-        )
+        ).toFloat()
 
         // Prevent scaling up if not allowed
         if (!scaleUp) {
-            ratio = min(ratio, 1.0)
+            ratio = min(ratio, 1.0f)
         }
 
         // Calculate new unpadded dimensions
         val newUnpadW = round(originalShape.width * ratio).toInt()
         val newUnpadH = round(originalShape.height * ratio).toInt()
 
-        // Calculate padding
-        var dw = newShape.width - newUnpadW
-        var dh = newShape.height - newUnpadH
+        // Calculate padding - convert to Float
+        var dw = (newShape.width - newUnpadW).toFloat()
+        var dh = (newShape.height - newUnpadH).toFloat()
 
         if (auto) {
             // Adjust padding to be multiple of stride
-            dw = (dw % stride) / 2
-            dh = (dh % stride) / 2
+            dw = ((dw % stride) / 2).toFloat()
+            dh = ((dh % stride) / 2).toFloat()
         } else if (scaleFill) {
             // Scale to fill without maintaining aspect ratio
-            dw = 0.0
-            dh = 0.0
+            dw = 0.0f
+            dh = 0.0f
             Imgproc.resize(image, outImage, newShape)
             return
         }
+
+        // Debug for letterbox calculations
+        debug("Letterbox: original=${originalShape.width}x${originalShape.height}, " +
+              "new=${newUnpadW}x${newUnpadH}, ratio=$ratio, pad=($dw,$dh)")
 
         // Calculate padded dimensions
         val padLeft = (dw / 2).toInt()
@@ -601,7 +756,9 @@ class YOLO11Detector(
         Imgproc.resize(
             image,
             outImage,
-            Size(newUnpadW.toDouble(), newUnpadH.toDouble())
+            Size(newUnpadW.toDouble(), newUnpadH.toDouble()),
+            0.0, 0.0,
+            Imgproc.INTER_LINEAR
         )
 
         // Apply padding
@@ -619,6 +776,7 @@ class YOLO11Detector(
 
     /**
      * Scale coordinates from model input size to original image size
+     * Fixed to convert Double to Float for proper type handling
      */
     private fun scaleCoords(
         imageShape: Size,
@@ -626,33 +784,45 @@ class YOLO11Detector(
         imageOriginalShape: Size,
         clip: Boolean = true
     ): RectF {
-        // Calculate gain based on aspect ratio
+        // Calculate gain - explicitly convert Double to Float
         val gain = min(
-            imageShape.height / imageOriginalShape.height,
-            imageShape.width / imageOriginalShape.width
-        )
-
-        // Calculate padding
-        val padX = (imageShape.width - imageOriginalShape.width * gain) / 2
-        val padY = (imageShape.height - imageOriginalShape.height * gain) / 2
-
+            imageShape.width / imageOriginalShape.width,
+            imageShape.height / imageOriginalShape.height
+        ).toFloat()
+        
+        // Calculate padding - explicitly convert Double to Float
+        val padX = ((imageShape.width - imageOriginalShape.width * gain) / 2.0).toFloat()
+        val padY = ((imageShape.height - imageOriginalShape.height * gain) / 2.0).toFloat()
+        
+        // Debug inputs for verification
+        debug("Scaling: coords=${coords.left},${coords.top},${coords.right},${coords.bottom}")
+        debug("Scaling: shape=${imageShape.width}x${imageShape.height}, originalShape=${imageOriginalShape.width}x${imageOriginalShape.height}")
+        debug("Scaling: gain=$gain, pad=($padX,$padY)")
+        
         // Scale coordinates back to original image size
         val scaledLeft = (coords.left - padX) / gain
         val scaledTop = (coords.top - padY) / gain
         val scaledRight = (coords.right - padX) / gain
         val scaledBottom = (coords.bottom - padY) / gain
-
+        
+        debug("Scaling: result=${scaledLeft},${scaledTop},${scaledRight},${scaledBottom}")
+        
+        // Create result rectangle with validation
+        val result = RectF(
+            scaledLeft,
+            scaledTop,
+            scaledRight,
+            scaledBottom
+        )
+        
         // Clip coordinates to image boundaries if requested
-        val result = RectF(scaledLeft.toFloat(), scaledTop.toFloat(),
-            scaledRight.toFloat().toFloat(), scaledBottom.toFloat())
-
         if (clip) {
-            result.left = clamp(result.left, 0f, imageOriginalShape.width.toFloat())
-            result.top = clamp(result.top, 0f, imageOriginalShape.height.toFloat())
-            result.right = clamp(result.right, 0f, imageOriginalShape.width.toFloat())
-            result.bottom = clamp(result.bottom, 0f, imageOriginalShape.height.toFloat())
+            result.left = max(0f, min(result.left, imageOriginalShape.width.toFloat()))
+            result.top = max(0f, min(result.top, imageOriginalShape.height.toFloat()))
+            result.right = max(0f, min(result.right, imageOriginalShape.width.toFloat()))
+            result.bottom = max(0f, min(result.bottom, imageOriginalShape.height.toFloat()))
         }
-
+        
         return result
     }
 
@@ -669,6 +839,7 @@ class YOLO11Detector(
 
     /**
      * Non-Maximum Suppression implementation to filter redundant boxes
+     * Updated to exactly match the C++ implementation
      */
     private fun nonMaxSuppression(
         boxes: List<RectF>,
@@ -684,10 +855,14 @@ class YOLO11Detector(
             return
         }
 
-        // Create list of indices sorted by score
+        // Create list of indices sorted by score (highest first)
         val sortedIndices = boxes.indices
             .filter { scores[it] >= scoreThreshold }
             .sortedByDescending { scores[it] }
+
+        if (sortedIndices.isEmpty()) {
+            return
+        }
 
         // Calculate areas once
         val areas = boxes.map { (it.right - it.left) * (it.bottom - it.top) }
@@ -752,8 +927,19 @@ class YOLO11Detector(
      * Debug print function
      */
     private fun debug(message: String) {
+        Log.d(TAG, message)
         if (BuildConfig.DEBUG) {
             println("YOLO11Detector: $message")
+        }
+    }
+
+    // Add ScopedTimer implementation (if missing)
+    private class ScopedTimer(private val name: String) {
+        private val startTime = SystemClock.elapsedRealtime()
+
+        fun stop() {
+            val endTime = SystemClock.elapsedRealtime()
+//            debug("$name took ${endTime - startTime} ms")
         }
     }
 }
