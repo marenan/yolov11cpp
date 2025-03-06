@@ -117,6 +117,9 @@ class YOLO11Detector(
                iouThreshold: Float = IOU_THRESHOLD): List<Detection> {
         val startTime = SystemClock.elapsedRealtime()
         debug("Starting detection with conf=$confidenceThreshold, iou=$iouThreshold")
+        
+        // Add debug for input dimensions
+        debug("Input image dimensions: ${bitmap.width}x${bitmap.height}")
 
         // Convert Bitmap to Mat for OpenCV processing
         val inputMat = Mat()
@@ -127,11 +130,15 @@ class YOLO11Detector(
         val originalSize = Size(bitmap.width.toDouble(), bitmap.height.toDouble())
         val resizedImgMat = Mat() // Will hold the resized image
 
-        // First preprocess using OpenCV (exactly like C++ version)
+        // Input shape for model
+        val modelInputShape = Size(inputWidth.toDouble(), inputHeight.toDouble())
+        debug("Model input shape: ${modelInputShape.width.toInt()}x${modelInputShape.height.toInt()}")
+
+        // First preprocess using OpenCV
         val inputTensor = preprocessImageOpenCV(
             inputMat,
             resizedImgMat,
-            Size(inputWidth.toDouble(), inputHeight.toDouble())
+            modelInputShape
         )
 
         // Run inference
@@ -266,7 +273,7 @@ class YOLO11Detector(
 
     /**
      * Post-processes the model outputs to extract detections
-     * Fixed to properly handle YOLOv11 output tensor format [1,88,8400]
+     * Modified to correctly handle normalized coordinates
      */
     private fun postprocess(
         outputMap: Map<Int, Any>,
@@ -326,14 +333,13 @@ class YOLO11Detector(
 
                 // Filter by confidence threshold
                 if (maxScore >= confThreshold) {
-                    // Extract bounding box coordinates (stored in first 4 channels)
-                    // The data is arranged as [x1,x2,...,xn, y1,y2,...,yn, w1,w2,...,wn, h1,h2,...,hn, scores...]
+                    // Extract bounding box coordinates (normalized between 0-1)
                     val x = outputArray[0 * num_predictions + i]  // center_x
                     val y = outputArray[1 * num_predictions + i]  // center_y
                     val w = outputArray[2 * num_predictions + i]  // width
                     val h = outputArray[3 * num_predictions + i]  // height
 
-                    // Convert from center format (xywh) to corner format (xyxy)
+                    // Convert from center format (xywh) to corner format (xyxy) - all normalized
                     val left = x - w / 2
                     val top = y - h / 2
                     val right = x + w / 2
@@ -762,7 +768,7 @@ class YOLO11Detector(
 
     /**
      * Scale coordinates from model input size to original image size
-     * Updated to handle letterboxing correctly for YOLOv11
+     * Fixed to correctly handle the absolute pixel padding
      */
     private fun scaleCoords(
         imageShape: Size,
@@ -770,30 +776,37 @@ class YOLO11Detector(
         imageOriginalShape: Size,
         clip: Boolean = true
     ): RectF {
-        // Calculate the scaling factor and padding
-        val original_h = imageOriginalShape.height.toFloat()
-        val original_w = imageOriginalShape.width.toFloat()
-        val input_h = imageShape.height.toFloat()
-        val input_w = imageShape.width.toFloat()
+        // Get dimensions
+        val inputWidth = imageShape.width.toFloat()
+        val inputHeight = imageShape.height.toFloat()
+        val originalWidth = imageOriginalShape.width.toFloat()
+        val originalHeight = imageOriginalShape.height.toFloat()
         
-        // Calculate gain and padding
-        val gain = min(input_w / original_w, input_h / original_h)
+        // Calculate the scale factor (ratio) between original image and resized image
+        val gain = min(inputWidth / originalWidth, inputHeight / originalHeight)
         
-        // Calculate padding in the letterboxed image
-        val pad_w = (input_w - original_w * gain) / 2.0f
-        val pad_h = (input_h - original_h * gain) / 2.0f
+        // Calculate padding to make the resized image square (this is absolute pixels)
+        val padX = (inputWidth - originalWidth * gain) / 2.0f
+        val padY = (inputHeight - originalHeight * gain) / 2.0f
         
-        // Log details for debugging
-        debug("Scale coords: input=${input_w}x${input_h}, original=${original_w}x${original_h}")
-        debug("Scale coords: gain=$gain, padding=($pad_w, $pad_h)")
+        // Debug info
+        debug("Scale coords: input=${inputWidth}x${inputHeight}, original=${originalWidth}x${originalHeight}")
+        debug("Scale coords: gain=$gain, padding=($padX, $padY)")
         debug("Scale coords: input box=(${coords.left}, ${coords.top}, ${coords.right}, ${coords.bottom})")
         
-        // Inverse transform: from normalized input coordinates to original image coordinates
-        val x1 = (coords.left - pad_w) / gain
-        val y1 = (coords.top - pad_h) / gain
-        val x2 = (coords.right - pad_w) / gain
-        val y2 = (coords.bottom - pad_h) / gain
+        // IMPORTANT: Convert the normalized coordinates back to absolute pixel coordinates
+        val absLeft = coords.left * inputWidth
+        val absTop = coords.top * inputHeight
+        val absRight = coords.right * inputWidth
+        val absBottom = coords.bottom * inputHeight
         
+        // Remove padding and scale back to original image size
+        val x1 = (absLeft - padX) / gain
+        val y1 = (absTop - padY) / gain
+        val x2 = (absRight - padX) / gain
+        val y2 = (absBottom - padY) / gain
+        
+        debug("Scale coords: absolute input=($absLeft, $absTop, $absRight, $absBottom)")
         debug("Scale coords: output box=($x1, $y1, $x2, $y2)")
         
         // Create result rectangle
@@ -801,10 +814,10 @@ class YOLO11Detector(
         
         // Clip to image boundaries if requested
         if (clip) {
-            result.left = max(0f, min(result.left, original_w - 1))
-            result.top = max(0f, min(result.top, original_h - 1))
-            result.right = max(0f, min(result.right, original_w))
-            result.bottom = max(0f, min(result.bottom, original_h))
+            result.left = max(0f, min(result.left, originalWidth))
+            result.top = max(0f, min(result.top, originalHeight))
+            result.right = max(0f, min(result.right, originalWidth))
+            result.bottom = max(0f, min(result.bottom, originalHeight))
         }
         
         return result
